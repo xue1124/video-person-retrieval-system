@@ -1,0 +1,17 @@
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.25
+# Ultralytics 会按实际分析 FPS 缩放；150 约等于保留丢失轨迹 5 秒。
+track_buffer: 150
+match_thresh: 0.80
+fuse_score: true
+
+# 固定摄像头不需要全局运动补偿；如果摄像头会晃动可改为 sparseOptFlow。
+gmc_method: none
+
+# 遮挡后预测框容易漂移，适当放宽空间门限，再由外观门限过滤。
+proximity_thresh: 0.20
+appearance_thresh: 0.75
+with_reid: true
+model: osnet

@@ -1,0 +1,15 @@
+[Unit]
+Description=Video analysis Celery worker
+After=network.target redis-server.service
+
+[Service]
+Type=simple
+User=videoapp
+WorkingDirectory=/opt/osnet-siglip
+EnvironmentFile=/opt/osnet-siglip/deploy/env/siglip.env
+ExecStart=/opt/osnet-siglip/.venv/bin/python -m celery -A tasks.app worker --loglevel=info --pool=threads --concurrency=1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
