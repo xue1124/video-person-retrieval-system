@@ -45,8 +45,6 @@ query_storage/
 temp_clips/
 tracking_snapshots/
 tracking_faiss/
-tracking_experiments/outputs/
-tracking_experiments/clips/
 logs/
 run/
 *.log
@@ -67,4 +65,5 @@ run/
 *.zip
 *.tar*
 schema.sql
+!sql/schema.sql
 dump*.sql

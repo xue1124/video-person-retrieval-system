@@ -1,3 +1,9 @@
+"""FastAPI 应用入口。
+
+本文件负责组装中间件和路由，并保留视频源、建模与检索这几组历史接口。
+具体的模型推理、异步任务和数据库操作分别位于 ``services/`` 与 ``tasks.py``。
+"""
+
 import json
 import os
 import re
@@ -14,26 +20,27 @@ from typing import Any, Dict, List, Optional
 
 def _bootstrap_siglip_env() -> None:
     """
-    在 import tasks / search_service 之前执行。
+    在 import tasks / search service 之前执行。
     若未设置环境变量且本机存在 SigLip_demo 默认布局，则自动填充（可被已有环境变量覆盖）。
     """
-    demo = os.environ.get("SIGLIP_DEMO_ROOT", str(Path(__file__).resolve().parent))
-    tok = os.path.join(demo, "siglip_v1")
-    if os.path.isfile(os.path.join(tok, "tokenizer_config.json")):
-        os.environ.setdefault("SIGLIP_TOKENIZER_PATH", tok)
+    demo = Path(os.environ.get("SIGLIP_DEMO_ROOT", str(Path(__file__).resolve().parent)))
+    model_root = Path(os.environ.get("MODEL_ROOT", str(demo / "models")))
+    tok = model_root / "tokenizer" / "siglip_v1"
+    if (tok / "tokenizer_config.json").is_file():
+        os.environ.setdefault("SIGLIP_TOKENIZER_PATH", str(tok))
     for path, key in (
-        (os.path.join(demo, "siglip_text.onnx"), "SIGLIP_TEXT_ONNX"),
-        (os.path.join(demo, "siglip_vision.onnx"), "SIGLIP_VISION_ONNX"),
+        (model_root / "onnx" / "siglip_text.onnx", "SIGLIP_TEXT_ONNX"),
+        (model_root / "onnx" / "siglip_vision.onnx", "SIGLIP_VISION_ONNX"),
     ):
-        if os.path.isfile(path):
-            os.environ.setdefault(key, path)
+        if path.is_file():
+            os.environ.setdefault(key, str(path))
 
 
 _bootstrap_siglip_env()
 
 import threading
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -42,39 +49,39 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 import xml.etree.ElementTree as ET
 
-from auth_deps import (
-    create_access_token,
-    fetch_user_by_username,
+from services.auth.dependencies import (
     get_current_user,
     get_current_user_media,
     require_admin,
-    verify_password,
 )
-import db as app_db
-from media_cleanup import purge_video_modeling_artifacts
-from room_copresence import perform_room_copresence
-from search_service import perform_search
-from video_time import parse_user_captured_at
-from tasks import (
-    process_video_task,
-    app as celery_app,
-    get_runtime_backend_info,
-    get_resources,
-    warm_live_detector,
+from services.persistence import database as app_db
+from services.persistence.cleanup import purge_video_modeling_artifacts
+from services.media.time_utils import parse_user_captured_at
+from services.config import (
+    GALLERY_DIR as GALLERY_PATH,
+    PROJECT_ROOT,
+    QUERY_STORAGE_DIR,
+    SNAPSHOT_DIR,
+    TEMP_DIR,
+    VIDEO_DIR as VIDEO_PATH,
+    ensure_runtime_directories,
 )
+from tasks import process_video_task
+from services.inference.runtime import warm_live_detector
+from services.tasks.celery_app import app as celery_app
 from requests.auth import HTTPDigestAuth
 from urllib.parse import quote_plus
 
 import cv2
 import numpy as np
 
-from video_playback import (
+from services.media.playback import (
     is_browser_friendly_mp4 as _is_browser_friendly_mp4,
     is_finalize_in_progress,
     playback_revision,
 )
-from room_geometry import polygons_from_freedraw_rgba, stroke_polygon_to_natural
-from rtsp_live import (
+from services.analysis.room_geometry import polygons_from_freedraw_rgba, stroke_polygon_to_natural
+from services.tasks.rtsp_live import (
     SOURCE_TYPE_RTSP_LIVE,
     STATUS_STREAMING,
     STATUS_STOPPED,
@@ -92,18 +99,13 @@ engine: Engine = app_db.get_engine()
 FFMPEG_PATH = (
     os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 )
-BASE_DIR = Path(__file__).resolve().parent
-VIDEO_DIR = str(BASE_DIR / "video_archives")
-CLIP_DIR = str(BASE_DIR / "temp_clips")
-GALLERY_DIR = str(BASE_DIR / "video_crops")
-QUERY_STORAGE = str(BASE_DIR / "query_storage")
-SNAPSHOT_ROOT = Path(
-    os.environ.get("TRACKING_SNAPSHOT_ROOT", str(BASE_DIR / "tracking_snapshots"))
-).expanduser().resolve()
-
-for d in [VIDEO_DIR, CLIP_DIR, GALLERY_DIR, QUERY_STORAGE]:
-    if not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
+BASE_DIR = PROJECT_ROOT
+ensure_runtime_directories()
+VIDEO_DIR = str(VIDEO_PATH)
+CLIP_DIR = str(TEMP_DIR)
+GALLERY_DIR = str(GALLERY_PATH)
+QUERY_STORAGE = str(QUERY_STORAGE_DIR)
+SNAPSHOT_ROOT = SNAPSHOT_DIR
 
 if not os.path.exists(FFMPEG_PATH):
     raise RuntimeError(
@@ -147,8 +149,8 @@ async def lifespan(app: FastAPI):
     print(
         "🧩 SigLIP 环境: "
         f"SIGLIP_TOKENIZER_PATH={os.environ.get('SIGLIP_TOKENIZER_PATH', '(未设置)')} | "
-        f"SIGLIP_TEXT_ONNX={os.environ.get('SIGLIP_TEXT_ONNX', 'siglip_text.onnx')} | "
-        f"SIGLIP_VISION_ONNX={os.environ.get('SIGLIP_VISION_ONNX', 'siglip_vision.onnx')}"
+        f"SIGLIP_TEXT_ONNX={os.environ.get('SIGLIP_TEXT_ONNX', 'models/onnx/siglip_text.onnx')} | "
+        f"SIGLIP_VISION_ONNX={os.environ.get('SIGLIP_VISION_ONNX', 'models/onnx/siglip_vision.onnx')}"
     )
     print(
         "🛠 媒体工具解析: "
@@ -161,19 +163,33 @@ async def lifespan(app: FastAPI):
     shutdown_all()
 
 
-app = FastAPI(title="SigLIP ISAPI API", lifespan=lifespan)
+app = FastAPI(title="医保智能稽查分析系统 API", lifespan=lifespan)
+
+cors_origins = [
+    value.strip()
+    for value in os.getenv("CORS_ORIGINS", "http://localhost:5174").split(",")
+    if value.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","),
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-from tracking_api import router as tracking_router  # noqa: E402
-from reports.api import router as reports_router  # noqa: E402
+from api.tracking import router as tracking_router  # noqa: E402
+from api.reports import router as reports_router  # noqa: E402
+from api.auth import router as auth_router  # noqa: E402
+from api.system import router as system_router  # noqa: E402
+from api.task_control import router as task_control_router  # noqa: E402
+from api.search import router as search_router  # noqa: E402
 
+app.include_router(system_router)
+app.include_router(auth_router)
+app.include_router(task_control_router)
+app.include_router(search_router)
 app.include_router(tracking_router)
 app.include_router(reports_router)
 
@@ -291,7 +307,7 @@ def _extract_isapi_channels(xml_text: str) -> List[dict]:
 
 
 def _discover_isapi_channels(host: str, username: str, password: str) -> List[dict]:
-    from box_tunnel import isapi_proxy_headers, isapi_proxy_url, normalize_nvr_host
+    from services.integrations.nvr_tunnel import isapi_proxy_headers, isapi_proxy_url, normalize_nvr_host
 
     auth = HTTPDigestAuth(username, password)
     target = normalize_nvr_host(host)
@@ -344,21 +360,7 @@ def _auto_isapi_task_name(channel: int, start: str, end: str) -> str:
     return f"海康回放_通道{channel:02d}_{_format_task_time_label(start)}_{_format_task_time_label(end)}"
 
 
-# ---------- 健康检查（无需登录）----------
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-@app.get("/runtime/backends")
-def runtime_backends(user: dict = Depends(get_current_user)):
-    """
-    返回当前进程中的模型加载状态与实际 Provider（TRT/CUDA/CPU）。
-    注意：API 与 Celery Worker 为不同进程，应分别查看各自日志。
-    """
-    return get_runtime_backend_info()
-
-
+# ---------- NVR通道发现 ----------
 @app.post("/isapi/channels")
 def detect_isapi_channels(
     host: str = Form(...),
@@ -369,69 +371,6 @@ def detect_isapi_channels(
     if not host or not username or not str(password).strip():
         raise HTTPException(status_code=400, detail="请先填写设备 IP、用户名和密码")
     return {"channels": _discover_isapi_channels(host, username, password)}
-
-
-@app.get("/celery/inspect")
-def celery_inspect(user: dict = Depends(get_current_user)):
-    """
-    查看 Celery worker 是否在消费任务、当前在执行什么。
-    Redis 里通常看不到「任务列表」：消息进默认队列后很快被 worker 取走。
-    """
-    broker = str(celery_app.conf.broker_url or "")
-    insp = celery_app.control.inspect(timeout=3.0)
-    if not insp:
-        return {
-            "ok": False,
-            "broker": broker,
-            "hint": "没有 worker 在超时内响应：请启动 celery worker，并确保与 API 使用同一 CELERY_BROKER_URL。",
-        }
-    out = {
-        "ok": True,
-        "broker": broker,
-        "active": insp.active() or {},
-        "reserved": insp.reserved() or {},
-        "scheduled": insp.scheduled() or {},
-        "stats": insp.stats() or {},
-    }
-    try:
-        import redis as redis_lib
-
-        r = redis_lib.Redis.from_url(
-            os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
-        )
-        out["redis_llen_celery_queue"] = int(r.llen("celery"))
-    except Exception as e:
-        out["redis_llen_celery_queue"] = None
-        out["redis_queue_note"] = str(e)
-    return out
-
-
-# ---------- 认证 ----------
-class LoginBody(BaseModel):
-    username: str
-    password: str
-
-
-@app.post("/auth/login")
-def login(body: LoginBody, request: Request):
-    eng = request.app.state.engine
-    row = fetch_user_by_username(eng, body.username)
-    if not row or not row["is_active"]:
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
-    if not verify_password(body.password, row["password_hash"]):
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
-    token = create_access_token(row["username"], row["role"])
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "username": row["username"],
-        "role": row["role"],
-    }
-
-
-@app.get("/auth/me")
-def me(user: dict = Depends(get_current_user)):
-    return {"username": user["username"], "role": user["role"]}
 
 
 # ---------- 静态资源（需登录）----------
@@ -693,7 +632,7 @@ def _delete_media_source_internal(
         request_stop_and_wait(file_name, timeout=10.0)
     elif st == "transcoding":
         try:
-            from video_playback import cleanup_finalize_sidecars
+            from services.media.playback import cleanup_finalize_sidecars
 
             rp = str(raw_path_db or "").strip()
             if rp and not rp.startswith(("rtsp://", "isapi://")):
@@ -720,10 +659,10 @@ def _delete_media_source_internal(
         remove_rooms=False,
     )
     try:
-        from tracking_v3.purge import purge_tracking_by_file_name
+        from services.analysis.tracking.purge import purge_tracking_by_file_name
 
-        v3_purge = purge_tracking_by_file_name(file_name)
-        print(f"[media] 已清理 medical_audit_v3: {v3_purge}", flush=True)
+        tracking_purge = purge_tracking_by_file_name(file_name)
+        print(f"[media] 已清理 medical_audit_v3: {tracking_purge}", flush=True)
     except Exception as exc:
         print(f"[media] 清理 medical_audit_v3 失败: {exc}", flush=True)
         with eng.begin() as conn:
@@ -747,8 +686,8 @@ def delete_media_source(
 async def start_rtsp_live_stream(
     rtsp_url: str = Form(...),
     file_name: str = Form(...),
-    skip_frames: int = Form(...),
-    conf_val: float = Form(...),
+    skip_frames: int = Form(..., ge=1),
+    conf_val: float = Form(..., ge=0.0, le=1.0),
     user: dict = Depends(get_current_user),
 ):
     """启动 RTSP 实时建模；与离线任务不同，长驻线程边读边入库。"""
@@ -757,7 +696,7 @@ async def start_rtsp_live_stream(
     if not url.lower().startswith("rtsp://"):
         raise HTTPException(status_code=400, detail="RTSP 地址必须以 rtsp:// 开头")
     try:
-        from box_tunnel import resolve_rtsp_playback_url
+        from services.integrations.nvr_tunnel import resolve_rtsp_playback_url
 
         url = resolve_rtsp_playback_url(url)
     except Exception as e:
@@ -800,7 +739,6 @@ async def start_rtsp_live_stream(
         raise HTTPException(status_code=500, detail=f"媒体源记录写入失败: {e}")
 
     try:
-        get_resources()
         warm_live_detector()
         start_live_stream(
             engine=engine,
@@ -844,7 +782,7 @@ async def stop_rtsp_live_stream(
     request_stop_and_wait(name, timeout=15.0)
     if active_live_thread_count() == 0:
         try:
-            from box_tunnel import stop_rtsp_relay
+            from services.integrations.nvr_tunnel import stop_rtsp_relay
 
             stop_rtsp_relay()
         except Exception:
@@ -875,7 +813,7 @@ def _bump_room_recompute(video_name: str) -> None:
 
 def _sync_rooms_fast(video_name: str) -> dict:
     """用当前 rooms 当场重算停留；切图放到后台。"""
-    from tracking_v3.sync_rooms import recompute_stays_for_video_name
+    from services.analysis.tracking.sync_rooms import recompute_stays_for_video_name
 
     return recompute_stays_for_video_name(video_name)
 
@@ -890,7 +828,7 @@ def _recompute_rooms_background(video_name: str) -> None:
                 if _room_recompute_done.get(video_name, -1) == start_gen:
                     return
             try:
-                from tracking_v3.sync_rooms import generate_snapshots_for_video_name
+                from services.analysis.tracking.sync_rooms import generate_snapshots_for_video_name
 
                 report = generate_snapshots_for_video_name(video_name)
                 print(f"[rooms] 后台快照重切完成: {report}", flush=True)
@@ -1298,8 +1236,8 @@ def get_video_clip(
 @app.post("/analyze")
 async def analyze_video(
     file: UploadFile = File(...),
-    skip_frames: int = Form(...),
-    conf_val: float = Form(...),
+    skip_frames: int = Form(..., ge=1),
+    conf_val: float = Form(..., ge=0.0, le=1.0),
     captured_at: Optional[str] = Form(None),
     user: dict = Depends(get_current_user),
 ):
@@ -1369,11 +1307,11 @@ async def analyze_video(
 
 @app.post("/analyze_stream")
 async def analyze_stream(
-    skip_frames: int = Form(...),
-    conf_val: float = Form(...),
+    skip_frames: int = Form(..., ge=1),
+    conf_val: float = Form(..., ge=0.0, le=1.0),
     url: Optional[str] = Form(None),
     start_time: Optional[str] = Form(None),
-    duration: int = Form(3600),
+    duration: int = Form(3600, ge=1, le=86400),
     source_mode: str = Form("isapi"),
     host: Optional[str] = Form(None),
     username: Optional[str] = Form(None),
@@ -1415,7 +1353,7 @@ async def analyze_stream(
             sep = "&" if "?" in user_url else "?"
             user_url = f"{user_url}{sep}starttime={start_time}"
         try:
-            from box_tunnel import resolve_rtsp_playback_url
+            from services.integrations.nvr_tunnel import resolve_rtsp_playback_url
 
             url = resolve_rtsp_playback_url(user_url)
         except Exception as e:
@@ -1501,239 +1439,3 @@ async def analyze_stream(
             )
         raise HTTPException(status_code=500, detail=f"任务入队失败: {e}")
     return {"task_id": task.id}
-
-
-@app.post("/stop_task")
-def stop_task(task_id: str, user: dict = Depends(get_current_user)):
-    celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
-    return {"status": "terminated"}
-
-
-@app.get("/status/{task_id}")
-def get_status(task_id: str, user: dict = Depends(get_current_user)):
-    res = celery_app.AsyncResult(task_id)
-    state = res.state
-    progress = (
-        100
-        if state == "SUCCESS"
-        else (
-            res.info.get("current", 0)
-            if isinstance(res.info, dict) and state == "PROGRESS"
-            else 0
-        )
-    )
-    return {"state": state, "progress": progress}
-
-
-# ---------- 检索 ----------
-@app.post("/search")
-async def search_trajectory(
-    algorithm: str = Form("SIGLIP"),
-    threshold: float = Form(0.85),
-    time_gap: float = Form(60.0),
-    group_mode: str = Form("false"),
-    co_time_threshold: float = Form(2.0),
-    q_text: Optional[str] = Form(None),
-    include_stay_segments: str = Form("true"),
-    files: Optional[List[UploadFile]] = File(None),
-    user: dict = Depends(get_current_user),
-):
-    image_bytes: List[bytes] = []
-    names: List[str] = []
-    for uf in files if files else []:
-        if not uf.filename:
-            continue
-        image_bytes.append(await uf.read())
-        names.append(uf.filename)
-    gm = str(group_mode).lower() in ("1", "true", "yes", "on")
-    inc_stay = str(include_stay_segments).lower() in ("1", "true", "yes", "on")
-    try:
-        payload = perform_search(
-            engine=engine,
-            algorithm=algorithm,
-            threshold=threshold,
-            time_gap=time_gap,
-            group_mode=gm,
-            co_time_threshold=co_time_threshold,
-            q_text=q_text,
-            image_bytes_list=image_bytes,
-            image_names=names,
-            include_stay_segments=inc_stay,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e) or e.__class__.__name__)
-    return {
-        "results": payload["results"],
-        "stay_segments": payload.get("stay_segments") or {},
-        "algorithm": payload["algorithm"],
-        "query_image_names": payload["query_image_names"],
-    }
-
-
-@app.post("/search/room-copresence")
-async def search_room_copresence(
-    algorithm: str = Form("OSNet"),
-    threshold: float = Form(0.85),
-    time_gap: float = Form(60.0),
-    role_a_label: str = Form("患者"),
-    role_b_label: str = Form("医生"),
-    role_a_files: List[UploadFile] = File(...),
-    role_b_files: Optional[List[UploadFile]] = File(None),
-    user: dict = Depends(get_current_user),
-):
-    """双人房间共现：患者/医生各可多图，检索与单人轨迹一致（分图检索后按 meta_id 并集取 max）。"""
-    bytes_a: List[bytes] = []
-    names_a: List[str] = []
-    for uf in role_a_files:
-        if not uf.filename:
-            continue
-        raw = await uf.read()
-        if raw:
-            bytes_a.append(raw)
-            names_a.append(uf.filename)
-    if not bytes_a:
-        raise HTTPException(status_code=400, detail="请至少上传一张有效的患者查询图")
-
-    bytes_b: List[bytes] = []
-    names_b: List[str] = []
-    for uf in role_b_files or []:
-        if not uf.filename:
-            continue
-        raw = await uf.read()
-        if raw:
-            bytes_b.append(raw)
-            names_b.append(uf.filename)
-
-    try:
-        payload = perform_room_copresence(
-            engine=engine,
-            algorithm=algorithm,
-            threshold=threshold,
-            time_gap=time_gap,
-            images_a_bytes=bytes_a,
-            images_a_names=names_a,
-            images_b_bytes=bytes_b if bytes_b else None,
-            images_b_names=names_b if names_b else None,
-            role_a_label=role_a_label,
-            role_b_label=role_b_label,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e) or e.__class__.__name__)
-    return payload
-
-
-class SaveSearchLogBody(BaseModel):
-    query_image_paths: str = ""
-    query_image_paths_b: str = ""
-    search_query: Optional[str] = None
-    algorithm: str
-    threshold: float
-    results: dict = {}
-    stay_segments: Optional[dict] = None
-    time_gap: Optional[float] = None
-    log_kind: str = "single"
-    copresence: Optional[dict] = None
-
-
-def _serialize_search_log_results(body: SaveSearchLogBody) -> str:
-    """v3 双人共现；v2 单人 stay_segments；旧版仅扁平 results。"""
-    if (body.log_kind or "").strip() == "room_copresence" and body.copresence is not None:
-        videos = body.copresence.get("videos", body.copresence)
-        return json.dumps(
-            {
-                "version": 3,
-                "kind": "room_copresence",
-                "algorithm": body.algorithm,
-                "threshold": float(body.threshold),
-                "time_gap": float(body.time_gap) if body.time_gap is not None else 60.0,
-                "query_image_a": body.query_image_paths or "",
-                "query_image_b": body.query_image_paths_b or "",
-                "videos": videos,
-            },
-            ensure_ascii=False,
-        )
-    if body.stay_segments is not None:
-        return json.dumps(
-            {
-                "version": 2,
-                "kind": "single",
-                "results": body.results,
-                "stay_segments": body.stay_segments,
-                "time_gap": float(body.time_gap) if body.time_gap is not None else 60.0,
-            },
-            ensure_ascii=False,
-        )
-    return json.dumps(body.results, ensure_ascii=False)
-
-
-@app.post("/search/logs")
-def save_search_log(body: SaveSearchLogBody, user: dict = Depends(get_current_user)):
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                INSERT INTO search_logs
-                (query_image_paths, search_query, algorithm, threshold, results_json, created_at)
-                VALUES (:imgs, :q, :algo, :th, :res, NOW())
-            """
-            ),
-            {
-                "imgs": body.query_image_paths,
-                "q": body.search_query or "",
-                "algo": body.algorithm,
-                "th": body.threshold,
-                "res": _serialize_search_log_results(body),
-            },
-        )
-    return {"ok": True}
-
-
-@app.get("/search/logs")
-def list_search_logs(user: dict = Depends(get_current_user)):
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT * FROM search_logs ORDER BY created_at DESC")
-        ).mappings().all()
-    out = []
-    for r in rows:
-        d = dict(r)
-        if d.get("created_at") is not None:
-            d["created_at"] = serialize_datetime(d["created_at"])
-        out.append(d)
-    return out
-
-
-def _reset_search_logs_auto_increment(conn) -> None:
-    """
-    删除后把自增起点设为 max(id)+1，表空时下一插入从 1 开始，避免删光 id=1 后新记录变成 id=2。
-    """
-    row = conn.execute(
-        text("SELECT COALESCE(MAX(id), 0) AS m FROM search_logs")
-    ).mappings().first()
-    next_val = int(row["m"] if row else 0) + 1
-    conn.execute(text(f"ALTER TABLE search_logs AUTO_INCREMENT = {next_val}"))
-
-
-@app.delete("/search/logs/{log_id}")
-def delete_search_log(log_id: int, user: dict = Depends(require_admin)):
-    with engine.begin() as conn:
-        res = conn.execute(text("DELETE FROM search_logs WHERE id=:id"), {"id": log_id})
-        if res.rowcount == 0:
-            raise HTTPException(status_code=404, detail="日志不存在")
-        _reset_search_logs_auto_increment(conn)
-    return {"ok": True}
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    # 关闭 access log，避免大量 /files/crop 请求刷屏掩盖关键运行信息
-    uvicorn.run(app, host="0.0.0.0", port=8001, access_log=False)

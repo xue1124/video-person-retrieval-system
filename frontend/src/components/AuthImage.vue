@@ -8,8 +8,10 @@ const props = withDefaults(
     alt?: string
     /** 预览大图等场景用 contain，列表缩略图默认 cover */
     fit?: 'cover' | 'contain'
+    /** 列表中的紧凑缩略图，不使用大图预览的最小高度 */
+    compact?: boolean
   }>(),
-  { fit: 'cover' },
+  { fit: 'cover', compact: false },
 )
 
 const isContain = computed(() => props.fit === 'contain')
@@ -44,7 +46,9 @@ onBeforeUnmount(() => {
     class="relative w-full bg-slate-800/40"
     :class="
       isContain
-        ? 'flex min-h-[200px] max-h-[85vh] items-center justify-center overflow-visible rounded-lg p-2'
+        ? compact
+          ? 'flex h-32 items-center justify-center overflow-hidden rounded-lg bg-slate-100 p-1'
+          : 'flex min-h-[200px] max-h-[85vh] items-center justify-center overflow-visible rounded-lg p-2'
         : 'min-h-[80px] overflow-hidden rounded-lg'
     "
   >
@@ -55,7 +59,9 @@ onBeforeUnmount(() => {
       :alt="alt || ''"
       :class="
         isContain
-          ? 'max-h-[82vh] max-w-full object-contain'
+          ? compact
+            ? 'max-h-full max-w-full object-contain'
+            : 'max-h-[82vh] max-w-full object-contain'
           : 'h-full w-full object-cover'
       "
     />

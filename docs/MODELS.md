@@ -1,25 +1,36 @@
 # 模型文件约定
 
-本仓库不包含权重，也不自动承诺任意同名模型可直接替换。需使用与预处理、输出维度、tokenizer 一致的导出模型；API 查询与 worker 建模必须采用相同版本。
+模型统一放在根目录 `models/`，具体清单见 [models/README.md](../models/README.md)。API查询与Celery建模必须使用同一版本的OSNet和SigLIP编码器，否则新查询向量与旧FAISS索引不在同一特征空间，需要重新建模或重建向量。
 
-| 文件/目录（默认位于仓库根目录） | 用途 |
+## 正式运行路径
+
+| 路径 | 作用 |
 | --- | --- |
-| `yolo11m.pt` 或兼容的 `yolo11m.engine` | 历史视频人物检测 |
-| `yolov10n.pt` 或 `yolov10n.engine` | `tasks.get_resources()` 中查询/实时相关资源加载依赖 |
-| `osnet_ain_msmt17_dynamic.onnx` | OSNet 编码，代码期望行人 crop 输入，512 维特征 |
-| `osnet_ain_msmt17_dynamic.onnx.data` | 如 ONNX 使用外置权重，必须一并提供且文件名匹配 |
-| `siglip_vision.onnx` | 图片编码，当前预处理固定 256×256、RGB、[-1,1] |
-| `siglip_text.onnx` 及其外置 `.data` | 文字编码，必须与图片编码器属于同一模型空间 |
-| `siglip_v1/` | 与文字模型匹配的 tokenizer 配置及词表文件 |
+| `models/pytorch/yolo11m.pt` | 历史视频人物检测的通用回退版本 |
+| `models/pytorch/yolov10n.pt` | RTSP实时检测及兼容流程 |
+| `models/onnx/osnet_ain_msmt17_dynamic.onnx` + `.data` | OSNet人物特征，输出512维向量 |
+| `models/onnx/siglip_vision.onnx` | 图片语义特征 |
+| `models/onnx/siglip_text.onnx` + `.data` | 文本语义特征 |
+| `models/tokenizer/siglip_v1/` | 与SigLIP文本模型匹配的分词器 |
 
-当前 `tasks.get_resources()` 会联合加载多个模型，因此仅测试 OSNet 图片检索时也可能需要 SigLIP 和 YOLO 文件。它尚未拆成按查询类型独立懒加载。
+如果CUDA可用且存在兼容的 `models/tensorrt/yolo11m.engine`，历史分析会优先使用它；OSNet会从三个Engine版本中选择可用版本。CPU环境会回退到PT/ONNX。RTSP链路仍固定使用 `.pt`，用于规避线程中重复加载TensorRT引擎造成的不稳定。
 
-OSNet 图片预处理以 `track_video.py` 和 `tasks.py` 中的实际实现为准。SigLIP 的导出输出名存在适配逻辑，不能仅按文件名判断模型兼容。替换编码器后需重算已有向量，不能混用旧索引。
+## 部署展示版本
 
-## TensorRT / RKNN
+- `models/onnx/` 保存通用推理和转换输入。
+- `models/tensorrt/` 保存NVIDIA GPU部署产物。
+- `models/rknn/` 保存瑞芯微NPU部署产物。
+- `deployment/rknn/convert_osnet.py` 保存OSNet转RKNN的实际辅助脚本。
 
-TensorRT engine 与构建时硬件和软件环境有关，建议在目标环境重新构建和验证。基础配置优先使用 YOLO `.pt` 与 OSNet ONNX，未强制启用原生 TensorRT。
+Engine与GPU架构、CUDA和TensorRT版本有关，目标机器不一致时需要重新构建。RKNN文件也必须与目标芯片和Toolkit版本匹配。当前FastAPI主流程不会直接加载RKNN，它们属于边缘设备部署产物。
 
-RKNN 转换辅助代码保留在 `rknn_export/`，它是部署实验资料，不表示现有 FastAPI 主流程已经支持直接加载任意 `.rknn` 文件。
+模型由 `services/inference/runtime.py` 按功能懒加载，因此只检查接口可不加载全部权重，但完整建模和检索仍需补齐对应模型。替换模型后应使用同一批样本核对尺寸、颜色通道、归一化、输出节点、NMS、特征维度及最终相似度。
 
-原始权重来源、准确版本和许可证需要由项目作者进一步补全。在确认分发权限前，不将模型放入 Git 或 Release。本整理过程没有上传或下载权重。
+本地检查：
+
+```bash
+python tools/check_models.py
+python tools/check_models.py --all-formats
+```
+
+模型文件默认被Git忽略。公开分发前需要确认权重许可证；超过GitHub普通Git单文件限制的模型应使用Git LFS、Release、模型仓库或单独下载地址。

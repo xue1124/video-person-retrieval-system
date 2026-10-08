@@ -53,13 +53,13 @@ const hasData = computed(() => hasStaySegments(props.staySegments))
       <el-table :data="group.rows" :row-key="segmentRowKey" border stripe size="small" class="w-full">
         <el-table-column type="expand">
           <template #default="{ row }">
-            <div class="grid grid-cols-1 gap-3 p-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            <div class="grid grid-cols-2 gap-2 p-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
               <div
                 v-for="(c, ci) in row.crops"
                 :key="cropStableKey(c, row)"
-                class="overflow-hidden rounded-lg border border-slate-200 bg-white p-2 shadow-sm"
+                class="overflow-hidden rounded-lg border border-slate-200 bg-white p-1.5 shadow-sm"
               >
-                <AuthImage :path="resolveCropPath(c)" class="aspect-video max-h-36 w-full object-cover" />
+                <AuthImage :path="resolveCropPath(c)" fit="contain" compact />
                 <div class="mt-1.5 truncate text-xs text-slate-600">
                   {{ fmtHms(c.time) }} · 相似 {{ formatSimilarityScore(c.score) }}
                   <span v-if="c.global_person_id != null"> · G{{ c.global_person_id }}</span>

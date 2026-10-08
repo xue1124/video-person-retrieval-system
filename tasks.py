@@ -1,116 +1,41 @@
-import cv2, os, time, shutil, torch, subprocess, uuid, re, sys, threading
-from typing import Callable, Optional
-import numpy as np
-import onnxruntime as ort
-from celery import Celery
-from ultralytics import YOLO
-from sqlalchemy import text
+"""Celery视频分析任务入口。
+
+FastAPI只负责登记任务并把消息放入Redis；Celery Worker加载本文件后执行
+``process_video_task``。模型推理由 ``services.inference`` 提供，人物分析主流程
+由 ``services.analysis.tracking.workflow`` 编排，本文件只保留任务状态和视频来源准备。
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import time
+import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from PIL import Image
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from decord import VideoReader, cpu
+from typing import Callable, Optional
+from urllib.parse import parse_qs, unquote, urlparse
+
+import cv2
 import requests
 from requests import exceptions as requests_exc
-import xml.etree.ElementTree as ET
 from requests.auth import HTTPDigestAuth
-from urllib.parse import urlparse, parse_qs, unquote
+from sqlalchemy import text
 
-from media_cleanup import purge_video_modeling_artifacts
-import db as app_db
-from video_time import db_datetime_to_utc_iso, parse_user_captured_at
-
-# 引入 transformers 用于处理 SigLIP 的文本分词
-from transformers import AutoTokenizer
-from celery.signals import task_failure, task_postrun, task_prerun, worker_ready
-
-# API 与 Worker 必须用同一 broker/backend；可用环境变量覆盖
-app_db.load_siglip_env()
-_CELERY_BROKER = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
-_CELERY_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", _CELERY_BROKER)
-
-app = Celery("reid_tasks", broker=_CELERY_BROKER, backend=_CELERY_BACKEND)
+from services.config import TEMP_DIR, VIDEO_DIR, ensure_runtime_directories
+from services.media.time_utils import db_datetime_to_utc_iso, parse_user_captured_at
+from services.persistence import database as app_db
+from services.persistence.cleanup import purge_video_modeling_artifacts
+from services.tasks.celery_app import app
+from services.tasks.support import (
+    get_task_engine as _ensure_sqlalchemy_engine,
+    mark_task_failed as _set_task_failed,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
-VIDEO_DIR = BASE_DIR / "video_archives"
-GALLERY_DIR = BASE_DIR / "video_crops"
-TEMP_DIR = BASE_DIR / "temp_clips"
-VIDEO_DIR.mkdir(exist_ok=True)
-GALLERY_DIR.mkdir(exist_ok=True)
-TEMP_DIR.mkdir(exist_ok=True)
-
-detector = None
-live_detector = None
-_live_detector_lock = threading.Lock()
-_live_predict_lock = threading.Lock()
-reid_sess = None
-siglip_vis_sess = None
-siglip_txt_sess = None
-siglip_tokenizer = None
-engine = None
-_resource_summary_printed = False
-
-_write_pool = ThreadPoolExecutor(max_workers=4)
-
-
-@worker_ready.connect
-def _on_celery_worker_ready(sender=None, **kwargs):
-    _log_runtime(
-        f"Celery worker 就绪 | broker={app.conf.broker_url} | "
-        "Windows 下 --pool=solo 为严格单任务串行；若常排队可改用 "
-        "--pool=threads --concurrency=2（注意 GPU 显存与设备稳定性）"
-    )
-    # 预热 tracking_v3 常驻 YOLO(TRT)+OSNet(TRT)，避免首个上传任务卡在编译/加载
-    if os.environ.get("TRACKING_V3_ENABLED", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        try:
-            from tracking_v3.engines import warm_tracking_engines
-
-            info = warm_tracking_engines()
-            _log_runtime(f"✅ tracking_v3 engines warmed | {info}")
-        except Exception as exc:
-            _log_runtime(f"⚠️ tracking_v3 engines 预热失败: {exc}")
-
-
-@task_prerun.connect
-def _on_celery_task_prerun(task_id=None, task=None, args=None, **_kw):
-    line = f"▶ TASK_START | id={task_id} | {getattr(task, 'name', '')}"
-    if args:
-        try:
-            vname = args[1] if len(args) > 1 else "?"
-            line += f" | video_name={vname!r}"
-        except Exception:
-            pass
-    print(line, flush=True)
-
-
-@task_postrun.connect
-def _on_celery_task_postrun(task_id=None, task=None, state=None, **kwargs):
-    print(
-        f"■ TASK_END | id={task_id} | {getattr(task, 'name', '')} | state={state}",
-        flush=True,
-    )
-
-
-@task_failure.connect
-def _on_celery_task_failure(task_id=None, exception=None, **kwargs):
-    print(f"✖ TASK_FAIL | id={task_id} | {exception!r}", flush=True)
-
-
-def _runtime_role() -> str:
-    argv = " ".join(sys.argv).lower()
-    if "celery" in argv:
-        return "WORKER"
-    if "uvicorn" in argv or "api_server.py" in argv:
-        return "API"
-    return "PROC"
-
-
-def _log_runtime(msg: str) -> None:
-    print(f"[{_runtime_role()}][pid={os.getpid()}] {msg}")
+ensure_runtime_directories()
 
 
 def _redact_source_url(value: str) -> str:
@@ -122,43 +47,6 @@ def _redact_source_url(value: str) -> str:
         redacted,
         flags=re.I,
     )
-
-
-def _session_info(sess: Optional[ort.InferenceSession]) -> dict:
-    if sess is None:
-        return {"loaded": False}
-    providers = sess.get_providers()
-    return {
-        "loaded": True,
-        "active_provider": providers[0] if providers else "unknown",
-        "providers": providers,
-        "inputs": [i.name for i in sess.get_inputs()],
-        "outputs": [o.name for o in sess.get_outputs()],
-    }
-
-
-def get_runtime_backend_info() -> dict:
-    return {
-        "role": _runtime_role(),
-        "pid": os.getpid(),
-        "yolo_loaded": detector is not None,
-        "osnet": _session_info(reid_sess),
-        "siglip_vision": _session_info(siglip_vis_sess),
-        "siglip_text": _session_info(siglip_txt_sess),
-        "tokenizer_loaded": siglip_tokenizer is not None,
-        "tokenizer_path": os.environ.get("SIGLIP_TOKENIZER_PATH", "(default)"),
-        "siglip_vision_onnx": os.environ.get("SIGLIP_VISION_ONNX", "siglip_vision.onnx"),
-        "siglip_text_onnx": os.environ.get("SIGLIP_TEXT_ONNX", "siglip_text.onnx"),
-        "ort_available_providers": ort.get_available_providers(),
-        "trt_cache_path": "./models/cache",
-    }
-
-def _ensure_sqlalchemy_engine():
-    """仅创建 DB 引擎（不加载 YOLO/ONNX），供任务开头尽快更新 videos 任务状态。"""
-    global engine
-    if engine is None:
-        engine = app_db.get_engine()
-    return engine
 
 
 def _isapi_time_span_hint(cfg: dict) -> str:
@@ -236,7 +124,7 @@ def _schedule_transcoding_finalize(
             ),
             {"c": count, "v": video_name},
         )
-    from video_playback import schedule_finalize_archive
+    from services.media.playback import schedule_finalize_archive
 
     schedule_finalize_archive(
         archive_path,
@@ -250,422 +138,7 @@ def _playback_finalize_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _set_task_failed(db_engine, video_name: str, reason: str) -> None:
-    """写入失败状态；若库表尚无 failure_reason 列则仅更新 status。"""
-    msg = (reason or "")[:500]
-    try:
-        with db_engine.begin() as conn:
-            conn.execute(
-                text(
-                    "UPDATE videos SET status='failed', failure_reason=:m "
-                    "WHERE file_name=:v AND is_media_source=1"
-                ),
-                {"m": msg, "v": video_name},
-            )
-    except Exception:
-        with db_engine.begin() as conn:
-            conn.execute(
-                text("UPDATE videos SET status='failed' WHERE file_name=:v AND is_media_source=1"),
-                {"v": video_name},
-            )
-
-
-def get_resources():
-    global detector, reid_sess, siglip_vis_sess, siglip_txt_sess, siglip_tokenizer, engine, _resource_summary_printed
-
-    _ensure_sqlalchemy_engine()
-        
-    # 1. YOLO 模型加载
-    if detector is None:
-        yolo_engine = "yolov10n.engine"
-        yolo_pt = "yolov10n.pt"
-        if os.path.exists(yolo_engine):
-            detector = YOLO(yolo_engine, task="detect")
-            _log_runtime("✅ YOLO(TensorRT Engine) loaded")
-        else:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            detector = YOLO(yolo_pt)
-            if device == "cuda":
-                detector.to(device)
-                # 强行统一为标准精度，避免 fuse 过程报错
-                detector.model.float() 
-            _log_runtime(f"✅ YOLO(.pt) loaded on {device}")
-
-    # 2. 公共 ORT (SigLIP/OSNet) 调度策略
-    providers = [
-        ('TensorrtExecutionProvider', {
-            'device_id': 0,
-            'trt_fp16_enable': False,  
-            'trt_engine_cache_enable': True,
-            'trt_engine_cache_path': './models/cache'
-        }),
-        ('CUDAExecutionProvider', {'device_id': 0}),
-        'CPUExecutionProvider'
-    ]
-    sess_options = ort.SessionOptions()
-    # 抑制 ORT warning 级别刷屏（如大量 unused initializer），保留 error/fatal
-    sess_options.log_severity_level = 3
-
-    # 3. OSNet 模型加载
-    if reid_sess is None:
-        onnx_model_path = "osnet_ain_msmt17_dynamic.onnx"
-        try:
-            reid_sess = ort.InferenceSession(
-                onnx_model_path,
-                sess_options=sess_options,
-                providers=providers
-            )
-            _log_runtime(
-                f"✅ OSNet ready | active={reid_sess.get_providers()[0]} | providers={reid_sess.get_providers()}"
-            )
-        except Exception as e:
-            reid_sess = ort.InferenceSession(
-                onnx_model_path,
-                sess_options=sess_options,
-                providers=['CPUExecutionProvider']
-            )
-            _log_runtime(f"⚠️ OSNet fallback to CPU due to: {e}")
-
-    # 4. SigLIP 模型加载 (Vision & Text)
-    if siglip_vis_sess is None:
-        vis_path = os.environ.get("SIGLIP_VISION_ONNX", "siglip_vision.onnx")
-        txt_path = os.environ.get("SIGLIP_TEXT_ONNX", "siglip_text.onnx")
-        os.makedirs("./models/cache", exist_ok=True)
-        
-        try:
-            _log_runtime(f"⏳ SigLIP Vision initializing from: {vis_path}")
-            siglip_vis_sess = ort.InferenceSession(
-                vis_path,
-                sess_options=sess_options,
-                providers=providers
-            )
-            _log_runtime(
-                "✅ SigLIP Vision ready | "
-                f"active={siglip_vis_sess.get_providers()[0]} | "
-                f"providers={siglip_vis_sess.get_providers()} | "
-                f"outputs={[o.name for o in siglip_vis_sess.get_outputs()]}"
-            )
-            
-            _log_runtime(f"⏳ SigLIP Text initializing from: {txt_path}")
-            # Text 用纯 CUDA，避免 TRT 编译开销
-            txt_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            siglip_txt_sess = ort.InferenceSession(
-                txt_path,
-                sess_options=sess_options,
-                providers=txt_providers
-            )
-            _log_runtime(
-                "✅ SigLIP Text ready | "
-                f"active={siglip_txt_sess.get_providers()[0]} | "
-                f"providers={siglip_txt_sess.get_providers()} | "
-                f"outputs={[o.name for o in siglip_txt_sess.get_outputs()]}"
-            )
-            
-            tok_path = _default_siglip_tokenizer_path()
-            siglip_tokenizer = _load_siglip_tokenizer(tok_path)
-            _log_runtime(f"✅ SigLIP tokenizer ready: {tok_path}")
-        except Exception as e:
-            _log_runtime(f"⚠️ SigLIP load error: {e} | trying fallback...")
-            siglip_vis_sess = ort.InferenceSession(
-                vis_path,
-                sess_options=sess_options,
-                providers=['CPUExecutionProvider']
-            )
-            # Text 兜底也用 CUDA，不用 TRT
-            siglip_txt_sess = ort.InferenceSession(
-                txt_path,
-                sess_options=sess_options,
-                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-            )
-            try:
-                tok_path = _default_siglip_tokenizer_path()
-                siglip_tokenizer = _load_siglip_tokenizer(tok_path)
-            except Exception:
-                tok_path = os.environ.get("SIGLIP_TOKENIZER_PATH", "google/siglip-base-patch16-224")
-                siglip_tokenizer = AutoTokenizer.from_pretrained(tok_path)
-            _log_runtime(
-                "✅ SigLIP fallback ready | "
-                f"vision_active={siglip_vis_sess.get_providers()[0]} | "
-                f"text_active={siglip_txt_sess.get_providers()[0]} | "
-                f"tokenizer={tok_path}"
-            )
-
-    if not _resource_summary_printed:
-        info = get_runtime_backend_info()
-        _log_runtime(
-            "🧭 Runtime summary | "
-            f"vision_active={info['siglip_vision'].get('active_provider', 'n/a')} | "
-            f"text_active={info['siglip_text'].get('active_provider', 'n/a')} | "
-            f"osnet_active={info['osnet'].get('active_provider', 'n/a')}"
-        )
-        _resource_summary_printed = True
-                
-    return detector, reid_sess, engine, siglip_vis_sess, siglip_txt_sess, siglip_tokenizer
-
-
-def _yolo_infer_device():
-    return 0 if torch.cuda.is_available() else "cpu"
-
-
-def get_live_detector():
-    """
-    RTSP 实时专用 YOLO（.pt）。
-    与 API/Celery 共用的 TensorRT .engine 分离，避免子线程二次加载 TRT 导致进程崩溃。
-    """
-    global live_detector
-    with _live_detector_lock:
-        if live_detector is None:
-            yolo_pt = "yolov10n.pt"
-            if not os.path.isfile(yolo_pt):
-                raise FileNotFoundError(f"RTSP 实时需要 {yolo_pt}，请放在项目根目录")
-            device = _yolo_infer_device()
-            live_detector = YOLO(yolo_pt)
-            if device != "cpu":
-                live_detector.to(device)
-                live_detector.model.float()
-            _log_runtime(f"✅ RTSP live YOLO(.pt) loaded on {device}")
-    return live_detector
-
-
-def live_yolo_predict(frame, conf_val: float):
-    """线程安全；供 RTSP 拉流线程调用。"""
-    det = get_live_detector()
-    with _live_predict_lock:
-        return det.predict(
-            frame,
-            classes=0,
-            conf=float(conf_val),
-            verbose=False,
-            device=_yolo_infer_device(),
-            half=False,
-        )
-
-
-def warm_live_detector() -> None:
-    """主线程预热 RTSP 用 YOLO，避免首次推理在子线程初始化。"""
-    import numpy as np
-
-    det = get_live_detector()
-    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-    with _live_predict_lock:
-        det.predict(
-            dummy,
-            classes=0,
-            conf=0.5,
-            verbose=False,
-            device=_yolo_infer_device(),
-            half=False,
-        )
-    _log_runtime("✅ RTSP live YOLO warmup done")
-
-
-def _default_siglip_tokenizer_path() -> str:
-    p = os.environ.get("SIGLIP_TOKENIZER_PATH")
-    if p and os.path.isdir(p) and os.path.isfile(os.path.join(p, "tokenizer_config.json")):
-        return p
-    demo = os.environ.get("SIGLIP_DEMO_ROOT", str(BASE_DIR))
-    for rel in ("siglip_v1", os.path.join("models", "siglip_v1")):
-        cand = os.path.join(demo, rel)
-        if os.path.isfile(os.path.join(cand, "tokenizer_config.json")):
-            return cand
-    return os.path.join(demo, "siglip_v1")
-
-
-def _load_siglip_tokenizer(path: str):
-    """本地优先；fast 失败时用 slow，避免缺少 sentencepiece 时无法实例化。"""
-    last_err = None
-    for use_fast in (True, False):
-        try:
-            return AutoTokenizer.from_pretrained(
-                path,
-                local_files_only=True,
-                trust_remote_code=True,
-                use_fast=use_fast,
-            )
-        except Exception as e:
-            last_err = e
-    raise last_err
-
-
-# ================= SigLIP 特征提取函数 =================
-def extract_siglip_feat_img(cv2_img):
-    """单图视觉特征提取"""
-    _, _, _, vis_sess, _, _ = get_resources()
-    if cv2_img is None: return None
-    img = cv2.resize(cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB), (256, 256))
-    img = img.astype(np.float32) / 255.0
-    img = (img - 0.5) / 0.5
-    img = np.transpose(img, (2, 0, 1))
-    img = np.expand_dims(img, axis=0) 
-    
-    feat = vis_sess.run(['1726'], {vis_sess.get_inputs()[0].name: img})[0]
-    feat = feat.astype(np.float32)
-        
-    norm = np.linalg.norm(feat, axis=1, keepdims=True)
-    feat = feat / (norm + 1e-8)
-    return feat.flatten() 
-
-def _siglip_text_onnx_feed(txt_sess, tokenizer, text_str):
-    """按输入名绑定，避免导出时 attention_mask 排在 input_ids 之前导致喂错张量。"""
-    tok = tokenizer(
-        [text_str],
-        padding="max_length",
-        max_length=64,
-        truncation=True,
-        return_tensors="np",
-    )
-    input_ids = tok["input_ids"].astype(np.int64)
-    att = tok["attention_mask"].astype(np.int64) if "attention_mask" in tok else None
-    feed = {}
-    for inp in txt_sess.get_inputs():
-        n = inp.name.lower()
-        if att is not None and "attention" in n:
-            feed[inp.name] = att
-        elif ("input" in n and "id" in n) or n in ("input_ids", "token_ids"):
-            feed[inp.name] = input_ids
-        elif "token_type" in n:
-            feed[inp.name] = np.zeros_like(input_ids, dtype=np.int64)
-        else:
-            feed[inp.name] = input_ids
-    return feed
-
-
-def extract_siglip_feat_text(text_str):
-    """文本特征提取：与底库 SigLIP 图像向量对齐（同维度、L2 归一化）。"""
-    _, _, _, _, txt_sess, tokenizer = get_resources()
-    try:
-        feed = _siglip_text_onnx_feed(txt_sess, tokenizer, text_str)
-        feat = txt_sess.run(['text_embeds'], feed)[0]
-        feat = feat.astype(np.float32)
-
-        if feat.ndim == 1:
-            feat = feat / (np.linalg.norm(feat) + 1e-8)
-            return feat.astype(np.float32)
-        feat /= np.linalg.norm(feat, axis=1, keepdims=True) + 1e-8
-        return feat.flatten()
-    except Exception as e:
-        print(f"SigLIP Text Error: {e}")
-        return None
-
-def extract_siglip_feat_img_batch(cv2_imgs):
-    """批量视觉特征提取"""
-    _, _, _, vis_sess, _, _ = get_resources()
-    if not cv2_imgs: return []
-    
-    resized_imgs = [cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), (256, 256)) for img in cv2_imgs]
-    batch_input = np.stack(resized_imgs, axis=0).astype(np.float32)
-    batch_input /= 255.0
-    batch_input = (batch_input - 0.5) / 0.5
-    batch_input = batch_input.transpose(0, 3, 1, 2)
-    
-    feats = vis_sess.run(['1726'], {vis_sess.get_inputs()[0].name: batch_input})[0]
-    feats = feats.astype(np.float32)
-    
-    norm = np.linalg.norm(feats, axis=1, keepdims=True)
-    feats = feats / (norm + 1e-8)
-    return feats
-
-# ================= OSNet 特征提取函数 =================
-def extract_osnet_feat_batch(cv2_imgs):
-    _, sess, _, _, _, _ = get_resources()
-    if not cv2_imgs: return []
-    resized_imgs = [cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), (128, 256)) for img in cv2_imgs]
-    batch_input = np.stack(resized_imgs, axis=0).astype(np.float32)
-    batch_input /= 255.0
-    batch_input -= np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    batch_input /= np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    batch_input = batch_input.transpose(0, 3, 1, 2)
-    feats = sess.run(None, {sess.get_inputs()[0].name: batch_input})[0]
-    feats = feats.astype(np.float32)
-    feats /= (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
-    return feats
-
-def extract_osnet_feat(cv2_img):
-    _, sess, _, _, _, _ = get_resources()
-    if cv2_img is None or cv2_img.size == 0: return None
-    try:
-        img = cv2.resize(cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB), (128, 256))
-        img = img.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        img = (img - mean) / std
-        img = img.transpose(2, 0, 1)[np.newaxis, :].astype(np.float32)
-        feat = sess.run(None, {sess.get_inputs()[0].name: img})[0]
-        feat = feat.astype(np.float32)
-        feat /= (np.linalg.norm(feat, axis=1, keepdims=True) + 1e-8)
-        return feat.flatten()
-    except: return None
-
-# ================= 辅助入库函数 =================
-def _write_gallery_frame(path: str, image: np.ndarray) -> bool:
-    """同步写 crop 到磁盘；成功才允许写入 gallery_meta。"""
-    try:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        ok = cv2.imwrite(str(p), image)
-        return bool(ok) and p.is_file() and p.stat().st_size > 0
-    except Exception:
-        return False
-
-
-def _flush_buffer(crop_buffer, full_frame_buffer, meta_buffer, db_engine):
-    """特征提取 → 落盘成功 → 再写库，保证 gallery_meta 与 video_crops 一致。"""
-    if not crop_buffer:
-        return 0
-
-    osnet_feats = extract_osnet_feat_batch(crop_buffer)
-    siglip_feats = extract_siglip_feat_img_batch(crop_buffer)
-
-    write_ok = [False] * len(crop_buffer)
-    futures = {
-        _write_pool.submit(
-            _write_gallery_frame, meta_buffer[i]["p"], full_frame_buffer[i]
-        ): i
-        for i in range(len(crop_buffer))
-    }
-    for fut in as_completed(futures):
-        idx = futures[fut]
-        try:
-            write_ok[idx] = bool(fut.result())
-        except Exception:
-            write_ok[idx] = False
-
-    db_insert_data = []
-    for idx, ok in enumerate(write_ok):
-        if not ok:
-            continue
-        m = meta_buffer[idx]
-        db_insert_data.append(
-            {
-                "v": m["v"],
-                "t": m["t"],
-                "p": m["p"],
-                "x1": int(m["x1"]),
-                "y1": int(m["y1"]),
-                "x2": int(m["x2"]),
-                "y2": int(m["y2"]),
-                "feat": osnet_feats[idx].tobytes(),
-                "cfeat": siglip_feats[idx].tobytes(),
-            }
-        )
-
-    if db_insert_data:
-        with db_engine.begin() as conn:
-            video_ids = {}
-            for item in db_insert_data:
-                name = item["v"]
-                if name not in video_ids:
-                    video_ids[name] = app_db.get_video_id(conn, name)
-                item["video_id"] = video_ids[name]
-            conn.execute(
-                text(
-                    "INSERT INTO gallery_meta (video_id, video_name, timestamp, image_path, "
-                    "bbox_x1, bbox_y1, bbox_x2, bbox_y2, feature_vector, clip_feature) "
-                    "VALUES (:video_id, :v, :t, :p, :x1, :y1, :x2, :y2, :feat, :cfeat)"
-                ),
-                db_insert_data,
-            )
-    return len(db_insert_data)
+# 模型加载与特征提取已集中到 services/inference；任务入口不再承载推理实现。
 
 # ================= 任务主入口 =================
 FFMPEG_PATH = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
@@ -904,7 +377,7 @@ def _download_video_via_isapi(
     <maxResults>200</maxResults>
 </CMSearchDescription>"""
 
-    from box_tunnel import isapi_proxy_headers, isapi_proxy_url
+    from services.integrations.nvr_tunnel import isapi_proxy_headers, isapi_proxy_url
 
     search_url = isapi_proxy_url("/ISAPI/ContentMgmt/search")
     proxy_headers = {
@@ -1069,7 +542,7 @@ def process_video_task(self, raw_path, video_name, skip_frames, conf_val, durati
     except Exception as ex:
         print(f"[WORKER] 早期 UPDATE videos 失败（可忽略）: {ex}", flush=True)
 
-    # 1. 资源获取
+    # 1. 取得数据库连接，并确认这仍是当前有效任务。
     db_engine = _ensure_sqlalchemy_engine()
 
     if not _media_source_row_exists(db_engine, video_name):
@@ -1078,6 +551,12 @@ def process_video_task(self, raw_path, video_name, skip_frames, conf_val, durati
             flush=True,
         )
         return {"status": "CANCELLED", "reason": "deleted"}
+    if not _task_still_current(db_engine, video_name, self.request.id):
+        print(
+            f"[WORKER] 任务已被终止或替换，跳过: {video_name}",
+            flush=True,
+        )
+        return {"status": "CANCELLED", "reason": "stopped_or_superseded"}
 
     # 支持两类网络源：历史 RTSP 与 ISAPI 回放；均先下载为本地文件再处理
     temp_download_file = None
@@ -1085,7 +564,7 @@ def process_video_task(self, raw_path, video_name, skip_frames, conf_val, durati
     download_weight = 35 if is_isapi_source else 0
     if raw_path.startswith("rtsp://") and "starttime=" in raw_path:
         try:
-            from box_tunnel import resolve_rtsp_playback_url
+            from services.integrations.nvr_tunnel import resolve_rtsp_playback_url
 
             raw_path = resolve_rtsp_playback_url(raw_path)
         except Exception as e:
@@ -1238,9 +717,9 @@ def process_video_task(self, raw_path, video_name, skip_frames, conf_val, durati
             },
         )
 
-    from tracking_v3 import run_tracking_v3_sidecar, tracking_v3_enabled
+    from services.analysis.tracking import analysis_enabled, run_video_analysis
 
-    if not tracking_v3_enabled():
+    if not analysis_enabled():
         reason = "已改为仅 OSNet 跟踪入库，请设置 TRACKING_V3_ENABLED=1"
         print(f"❌ {reason}", flush=True)
         _set_task_failed(db_engine, video_name, reason)
@@ -1298,7 +777,7 @@ def process_video_task(self, raw_path, video_name, skip_frames, conf_val, durati
             _set_progress(p, count)
 
         try:
-            v3_result = run_tracking_v3_sidecar(
+            analysis_result = run_video_analysis(
                 video_path=archive_path,
                 video_name=video_name,
                 raw_path=raw_path,
@@ -1319,7 +798,7 @@ def process_video_task(self, raw_path, video_name, skip_frames, conf_val, durati
             )
             return {"status": "CANCELLED", "reason": "deleted_during_track"}
         except Exception as track_exc:
-            # track_video.TrackingCancelled
+            # 用户删除或替换任务时，分析流程主动抛出的取消异常。
             if track_exc.__class__.__name__ == "TrackingCancelled":
                 print(
                     f"[WORKER] 跟踪已取消: {video_name} | {track_exc}",
@@ -1327,17 +806,20 @@ def process_video_task(self, raw_path, video_name, skip_frames, conf_val, durati
                 )
                 return {"status": "CANCELLED", "reason": "tracking_cancelled"}
             raise
-        if isinstance(v3_result, dict) and v3_result.get("skipped"):
-            return {"status": "CANCELLED", "reason": str(v3_result.get("skipped"))}
+        if isinstance(analysis_result, dict) and analysis_result.get("skipped"):
+            return {
+                "status": "CANCELLED",
+                "reason": str(analysis_result.get("skipped")),
+            }
         if not _task_still_current(db_engine, video_name, self.request.id):
             print(
                 f"[WORKER] 跟踪入库后任务已过期，不写回人数/完成态: {video_name}",
                 flush=True,
             )
             return {"status": "CANCELLED", "reason": "superseded_after_track"}
-        if isinstance(v3_result, dict):
+        if isinstance(analysis_result, dict):
             person_count = int(
-                (v3_result.get("import") or {}).get("person_count") or 0
+                (analysis_result.get("import") or {}).get("person_count") or 0
             )
         # 立即写回人数，避免前端长时间看到 0
         with db_engine.begin() as conn:
@@ -1349,10 +831,10 @@ def process_video_task(self, raw_path, video_name, skip_frames, conf_val, durati
                 {"c": person_count, "v": video_name},
             )
         _set_progress(99, person_count)
-    except Exception as v3_err:
+    except Exception as analysis_error:
         if not _task_still_current(db_engine, video_name, self.request.id):
             return {"status": "CANCELLED", "reason": "superseded"}
-        reason = f"OSNet 跟踪入库失败: {v3_err}"
+        reason = f"OSNet 跟踪入库失败: {analysis_error}"
         print(f"❌ {reason}", flush=True)
         _set_task_failed(db_engine, video_name, reason)
         return {"status": "FAILED", "error": reason}
@@ -1379,4 +861,4 @@ def process_video_task(self, raw_path, video_name, skip_frames, conf_val, durati
         except Exception:
             pass
 
-    return {"status": "SUCCESS", "count": person_count, "mode": "tracking_v3_only"}
+    return {"status": "SUCCESS", "count": person_count, "mode": "analysis_pipeline"}

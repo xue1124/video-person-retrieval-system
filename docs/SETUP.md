@@ -35,33 +35,24 @@ python -c "import secrets; print(secrets.token_hex(32))"
 
 将输出作为 `JWT_SECRET`，不要提交或分享。配置解析器读取普通 `KEY=VALUE`，不要在值外面添加引号或在值后写行尾注释。数据库密码包含特殊字符时需要 URL 编码。
 
-数据库名固定为 `medical_audit_v3`。请使用单独的开发 MySQL 实例或确认该名称没有存放已有业务数据。
+数据库名固定为 `medical_audit_v3`。名称中的 `v3` 只是最终结构版本，不代表运行时还连接 v2；请使用单独的开发 MySQL 实例或确认该名称没有存放已有业务数据。
 
 ## 3. 初始化空数据库
 
 在 MySQL 客户端依次执行下面文件（路径按仓库实际位置填写）：
 
-```sql
-SOURCE migrations/001_create_medical_audit_v3.sql;
-SOURCE migrations/002_person_snapshots.sql;
-SOURCE migrations/003_track_point_debug.sql;
-SOURCE migrations/004_migrate_v2_business.sql;
-SOURCE migrations/005_observation_embeddings.sql;
-SOURCE migrations/006_analysis_reports.sql;
-```
+在 DBeaver 中连接 MySQL，打开并完整执行 `sql/schema.sql`。它会创建正式系统所需的 17 张表；不需要再依次执行补丁文件。
 
-`003` 和 `004` 含非幂等 ALTER，只适用于本次新建结构，不能反复运行。当前 `006` 已包含软删除字段，使用下面的幂等脚本检查和补齐 `007`，不要直接重复执行 `007` 的 SQL：
+如需检查已有本地数据库与检索索引：
 
 ```bash
-python migrations/apply_007_analysis_reports_soft_delete.py
+python tools/verify_database.py
 ```
-
-历史迁移脚本可能引用旧库 `siglip_v2`，新装不要运行 `backfill_v2_to_v3.py` 或 `rollback_v3_to_v2.py`。本仓库未包含旧库的数据导出。
 
 创建首个账户：
 
 ```bash
-python scripts/create_user.py --username admin --role admin
+python tools/create_user.py --username admin --role admin
 ```
 
 按提示输入密码，脚本保存 bcrypt 哈希，不生成默认密码，也不覆盖已有用户。
@@ -73,7 +64,7 @@ python scripts/create_user.py --username admin --role admin
 在不同终端从仓库根目录运行：
 
 ```bash
-python -m uvicorn api_server:app --host 127.0.0.1 --port 8002
+python run_api.py
 python -m celery -A tasks.app worker --loglevel=info --pool=threads --concurrency=1
 ```
 
@@ -82,9 +73,10 @@ python -m celery -A tasks.app worker --loglevel=info --pool=threads --concurrenc
 ```bash
 cd frontend
 npm ci
-npm run build
 npm run dev
 ```
+
+`npm run dev` 用于本地开发；提交前可额外运行一次 `npm run build`，检查 TypeScript 并生成生产构建产物。二者不是必须同时常驻运行。
 
 若前端 Node 版本不满足依赖要求，需要切换到符合 lock 文件 engines 的版本。Linux 常驻服务模板在 `deploy/systemd/`，需按本机路径和用户修改。不要将 Windows `solo` 池当作多任务并发。
 
@@ -96,8 +88,14 @@ npm run dev
 4. 用该视频里的人物截图进行 OSNet 检索，确认能返回图片、时间并回放。
 5. 再测试文字查询及删除功能。测试素材和查询图片都留在本地。
 
+不依赖数据库和模型的源码契约测试：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## 外部服务
 
-`box_tunnel.py` 依赖 ISAPI HTTP 代理、RTSP 中继控制接口及流服务器；本仓库没有这些服务的实现。仅修改 NVR 地址不能保证接入可运行。
+`services/integrations/nvr_tunnel.py` 依赖 ISAPI HTTP 代理、RTSP 中继控制接口及流服务器；本仓库没有这些服务的实现。仅修改 NVR 地址不能保证接入可运行。
 
-Dify 报告需另外配置工作流 URL、密钥和符合 `reports/dify_client.py` 输入输出约定的工作流。本仓库不自动创建工作流。
+Dify 报告需另外配置工作流 URL、密钥和符合 `services/reports/dify_client.py` 输入输出约定的工作流。本仓库不自动创建工作流。

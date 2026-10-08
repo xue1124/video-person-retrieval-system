@@ -1,68 +1,100 @@
-# 监控视频人物检索系统
+# 医保智能稽查分析系统
 
-面向历史录像检索与稽查辅助的全栈应用：将视频中的人物检测结果、外观特征和出现时间结构化，支持人物截图检索、文字描述检索及结果回放。
+面向医保稽查场景的监控视频人物分析与检索系统。系统将视频中的人物、出现时间、所在区域和截图信息结构化，支持人物档案、图搜人、文搜人、停留记录与视频回放，帮助稽查人员快速定位目标人物及其活动轨迹。
 
-这是实习项目的源码整理版。保留前后端、异步分析、模型接入、数据库和检索主线；不包含业务录像、人物图片、真实配置或预训练权重。模型采用已有预训练模型，项目重点是应用集成与工程实现。
+该项目由本人在实习期间从 0 到 1 完成，主要负责需求落地、系统设计、前后端功能集成、视觉模型接入、数据库设计和部署验证。
 
-## 功能与边界
+## 项目功能
 
-- 本地视频上传、后台分析和进度查询。
-- YOLO 人物检测；OSNet 外观特征聚类；SigLIP 图文语义检索。
-- MySQL 保存业务记录与向量；两个独立 FAISS 索引分别服务 OSNet 和 SigLIP。
-- 人物出现记录、视频回放、区域停留、多目标共现、检索历史。
-- 保留 NVR/ISAPI、RTSP 接入代码，但代理和中继服务不在本仓库中，需自行部署。
-- 保留可选 Dify 报告功能；未提供已发布工作流或密钥，默认不配置。
+- 支持本地视频、NVR 历史回放和 RTSP 实时流接入。
+- 使用 YOLO 检测视频中的人物并生成人物截图（crop）。
+- 使用 OSNet 提取人物外观特征，完成人物 ID 聚类和主要的图搜图检索。
+- 使用 SigLIP 实现文搜图和语义图搜图。
+- 支持图搜人、人物档案、时间段整理、区域停留和视频回放。
+- 支持双人同房间共现分析、检索日志和稽查分析报告。
 
-目前应先复现“本地视频上传 → 分析 → 人物截图检索”。历史视频主流程采用直接检测与 OSNet 聚类，未运行 BoT-SORT；实时流有独立处理代码，不能假定与历史视频完全相同。
+## 系统流程
 
-## 技术结构
+### 1. 视频分析与建模
 
 ```text
-Vue 3 / TypeScript / Element Plus
-                  ↓ HTTP
-              FastAPI
-          ↙                 ↘
-Celery + Redis             检索服务
-      ↓                       ↓
-YOLO → crops → OSNet/SigLIP  查询向量 → FAISS → observation_id
-      ↓                                          ↓
-OSNet 聚类 → MySQL → FAISS                     MySQL → 展示结果
+本地视频 / NVR 回放
+  → FastAPI 创建任务
+  → Redis + Celery 异步分析
+  → 抽帧、YOLO 检测人物
+  → OSNet 提取特征并聚类；SigLIP 提取图像特征
+  → MySQL 保存结果，FAISS 建立索引
 ```
 
-人物聚类使用 HNSW 寻找候选，再由匹配规则决定身份归属。普通图片检索使用 `IndexIDMap2(IndexFlatIP)`，按阈值过滤后查询业务信息，再按视频与时间整理展示结果。文字检索还包含关键词处理与重排，不应将所有检索分支描述为同一套简单 Top-K。
+### 2. 人物检索
 
-## 从哪里读代码
+```text
+图片 → OSNet 特征 → OSNet FAISS 索引
+文字 / 图片 → SigLIP 特征 → SigLIP FAISS 索引
 
-| 入口 | 作用 |
+FAISS 返回 observation_id
+  → MySQL 查询人物、时间和视频
+  → 展示轨迹与视频回放
+```
+
+OSNet 是主要的图搜图方式；SigLIP 支持文搜图，也支持图搜图。两类索引都通过 `observation_id` 关联 MySQL。
+
+## 技术栈
+
+| 模块 | 技术 |
 | --- | --- |
-| `api_server.py` | `/analyze` 上传入队、`/search` 检索、状态及媒体接口 |
-| `tasks.py` | Celery 任务、视频来源准备、状态更新、查询特征提取 |
-| `tracking_v3/sidecar.py` | 组织分析、入库、跨视频关联及索引更新 |
-| `tracking_experiments/detect_reid_video.py` | 抽帧、检测、特征提取和直接聚类 |
-| `tracking_experiments/reid_match.py` | OSNet 身份匹配规则 |
-| `tracking_v3/search_index.py` | FAISS 建立、增量更新、查询和重建 |
-| `search_service.py` | 图片/文字检索与结果整理 |
-| `db.py`、`migrations/` | 数据库连接及表结构 |
-| `frontend/src/views/` | 上传、检索、回放和报告页面 |
+| 前端 | Vue 3、TypeScript、Element Plus、Axios、Vite |
+| 后端 | Python、FastAPI、Uvicorn、SQLAlchemy |
+| 异步任务 | Celery、Redis |
+| 数据存储 | MySQL、FAISS |
+| 视觉模型 | YOLO、OSNet、SigLIP |
+| 视频处理 | OpenCV、FFmpeg/FFprobe |
+| 模型部署 | PyTorch、ONNX Runtime、TensorRT、RKNN |
 
-`tracking_experiments/` 名称沿用早期实验阶段，但当前主流程仍引用其中的编码器、聚类与导入代码，不能整体删除。旧版 `track_video.py` 也包含生产流程复用的编码器。
+## 项目结构
 
-## 安装与启动
+```text
+osnet-siglip/
+├── api_server.py              # FastAPI应用入口和视频建模接口
+├── tasks.py                   # Celery视频分析任务入口
+├── run_api.py                 # 本地API启动入口
+├── api/                       # 登录、检索、任务、档案和报告路由
+├── services/
+│   ├── analysis/              # 人物检测、特征提取、ID聚类和分析流程
+│   ├── inference/             # YOLO、OSNet、SigLIP模型加载与推理
+│   ├── search/                # 图像/文字检索与结果整理
+│   ├── persistence/           # MySQL连接与数据清理
+│   ├── tasks/                 # Celery配置、实时流和任务辅助逻辑
+│   ├── media/                 # 视频回放、转码和时间处理
+│   ├── integrations/          # NVR ISAPI与RTSP适配
+│   ├── auth/                  # 登录和权限验证
+│   └── reports/               # 分析报告服务
+├── frontend/                  # Vue 3前端
+├── sql/schema.sql             # 完整MySQL初始化结构
+├── models/                    # 本地模型目录，权重默认不提交Git
+├── deployment/                # ONNX、TensorRT和RKNN转换资料
+├── tools/                     # 用户、数据库、模型和仓库检查工具
+└── docs/                      # 运行、代码地图和部署说明
+```
 
-详细步骤见 [运行说明](docs/SETUP.md)，模型文件要求见 [模型清单](docs/MODELS.md)。
+第一次阅读代码建议从 [代码地图](docs/CODE_MAP.md) 开始，再依次查看 `api_server.py`、`tasks.py` 和 `services/analysis/tracking/workflow.py`。
 
-需要 Python 3.10+、MySQL 8、Redis、FFmpeg/FFprobe、Node.js（满足 `frontend/package-lock.json` 中 Vite 的引擎要求），以及匹配的模型文件。NVIDIA GPU 建议用于实际视频处理；CUDA、PyTorch、ONNX Runtime、TensorRT 版本必须配套。
+## 本地运行
 
-基础依赖与硬件依赖分开安装。`requirements/original-environment.txt` 是原环境快照，不代表在新机器上一条命令即可安装，尤其不应直接混装其中的 CUDA 12 PyTorch 与 CUDA 13 TensorRT 包。
+运行环境需要 Python 3.10+、MySQL 8、Redis、FFmpeg/FFprobe 和 Node.js。实际视频分析建议使用 NVIDIA GPU。
 
-配置并初始化后，在仓库根目录分别启动：
+1. 安装与配置步骤见 [本地运行说明](docs/SETUP.md)。
+2. 模型文件与路径见 [模型清单](docs/MODELS.md)。
+3. 模型格式转换见 [部署说明](docs/DEPLOYMENT.md)。
+
+完成数据库和模型配置后，在项目根目录分别启动 API 与 Worker：
 
 ```bash
-python -m uvicorn api_server:app --host 127.0.0.1 --port 8002
+python run_api.py
 python -m celery -A tasks.app worker --loglevel=info --pool=threads --concurrency=1
 ```
 
-前端：
+启动前端：
 
 ```bash
 cd frontend
@@ -70,18 +102,16 @@ npm ci
 npm run dev
 ```
 
-打开 `http://localhost:5174`。前端 `/api` 代理到本机 `8002` 端口。以上为本地开发启动方式；不是直接面向公网的部署配置。
+浏览器访问 `http://localhost:5174`。
 
-## 验证与现有限制
-
-源码整理检查可运行：
+## 项目检查
 
 ```bash
-python scripts/check_repository.py
+python tools/check_repository.py
+python -m unittest discover -s tests -v
+
+cd frontend
+npm run build
 ```
 
-整理记录和验证范围见 [整理说明](docs/PREPARATION.md)。尚未在全新环境完成模型、数据库、NVR 和完整上传检索的端到端复现，不提供未经测量的准确率或性能提升数字。
-
-已知边界包括同名视频替换行为、Celery 与数据库双状态同步、实时流与历史检索数据链路差异，以及对模型导出接口的依赖。这些保留为明确的后续改进项，不将源码整理描述为全面生产化改造。
-
-公开前需确认实习代码的公开授权，并遵守依赖与预训练权重的许可证。本整理版未代替权利人选择开源许可证，也不包含可再分发的模型授权证明。
+模型权重、监控视频、人物截图、向量索引和真实环境配置均由 Git 忽略。NVR 接入需要另外部署对应的 ISAPI 代理与 RTSP 中继服务。
